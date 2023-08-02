@@ -38,7 +38,14 @@ ckpts={
         "dtu_scan118": "serial_train/full_dtu_dtu_scan118_with_mask_False_robo3/200000",
         "dtu_scan122": "serial_train/full_dtu_dtu_scan122_with_mask_False_robo3/200000"
     },
-    
+    "bmvs_with_mask_False":
+    {
+        "bmvs_man":"permuto_sdf_bmvs_man_default/120000"
+    },
+    "blender_with_mask_False":
+    {
+        "Ignatius":"custom_dataset/custom_Ignatius/200000"
+    }
 
 
 }

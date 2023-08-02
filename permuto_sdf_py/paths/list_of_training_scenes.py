@@ -23,16 +23,22 @@ datasets={
         "dtu_scan83",  
         "dtu_scan97"  
     },
+    # "bmvs":{
+    #     "bmvs_bear",  
+    #     "bmvs_clock",  
+    #     "bmvs_dog",  
+    #     "bmvs_durian",  
+    #     "bmvs_jade",  
+    #     "bmvs_man",  
+    #     "bmvs_sculpture",  
+    #     "bmvs_stone"
+    # },
     "bmvs":{
-        "bmvs_bear",  
-        "bmvs_clock",  
-        "bmvs_dog",  
-        "bmvs_durian",  
-        "bmvs_jade",  
-        "bmvs_man",  
-        "bmvs_sculpture",  
-        "bmvs_stone"
-    },
+        "bmvs_man"
+     },
+    "blender":{
+        "Ignatius"
+     },
     "multiface":{
         "0",  
         "1",  

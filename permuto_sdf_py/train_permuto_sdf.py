@@ -333,7 +333,10 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
                 cos_anneal_ratio=map_range_val(iter_nr_for_anneal, 0.0, hyperparams.forced_variance_finish_iter, 0.0, 1.0)
                 forced_variance=map_range_val(iter_nr_for_anneal, 0.0, hyperparams.forced_variance_finish_iter, 0.3, hyperparams.forced_variance_finish)
 
+                #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cuda")
                 ray_origins, ray_dirs, gt_selected, gt_mask, img_indices=PermutoSDF.random_rays_from_reel(tensor_reel, nr_rays_to_create) 
+                #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cpu")
+
                 ray_points_entry, ray_t_entry, ray_points_exit, ray_t_exit, does_ray_intersect_box=aabb.ray_intersection(ray_origins, ray_dirs)
 
 

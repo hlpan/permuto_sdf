@@ -137,7 +137,7 @@ def run():
     
     for scan_name in scenes_list:
 
-        loader, _= create_dataloader(config_path, args.dataset, scan_name, low_res, args.comp_name, args.with_mask)
+        #loader, _= create_dataloader(config_path, args.dataset, scan_name, low_res, args.comp_name, args.with_mask)
 
         print("extracting mesh for scene_name", scan_name)
 
@@ -152,7 +152,7 @@ def run():
         load_from_checkpoint(ckpt_path_full, model_sdf, model_rgb, model_bg, occupancy_grid)        
 
         #extract my mesh
-        extracted_mesh=extract_mesh_and_transform_to_original_tf(model_sdf, nr_points_per_dim, loader, aabb)
+        extracted_mesh=extract_mesh_and_transform_to_original_tf(model_sdf, nr_points_per_dim, None, aabb)
         
         #output path
         out_mesh_path=os.path.join(permuto_sdf_root,"results/output_permuto_sdf_meshes",args.dataset, config_training)
