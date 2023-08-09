@@ -163,7 +163,6 @@ def run():
 
     loader_train=DataLoaderNerf(config_path)
     loader_train.set_dataset_path("/workspace/home/nerf-data/my_nerf/")
-    #loader_train.set_restrict_to_scene_name("Truck")
     loader_train.set_restrict_to_scene_name("Ignatius")
     #loader_train.set_restrict_to_scene_name("Barn")
     #loader_train.set_restrict_to_scene_name("Germany")

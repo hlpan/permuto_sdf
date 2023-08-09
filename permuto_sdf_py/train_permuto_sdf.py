@@ -13,6 +13,7 @@ import time
 import argparse
 import math
 import random
+import math 
 
 import easypbr
 from easypbr  import *
@@ -243,9 +244,68 @@ def run_net_sphere_traced(frame, args, hyperparams, model_sdf, model_rgb, model_
 
 
 
+def get_colmap_rays(colmap_data, train_num_rays = 512):
+    "get train_num_rays random rays from colmap dataset"
 
-def train(args, config_path, hyperparams, train_params, loader_train, experiment_name, with_viewer, checkpoint_path, tensor_reel, frames_train=None, hardcoded_cam_init=True):
+    tensor_size = size=(train_num_rays,)
+    image_index = torch.randint(0, len(colmap_data.all_c2w), size=tensor_size, device=torch.device('cpu'))
+    x_rand = torch.rand(size=tensor_size, device=torch.device('cpu'))
+    y_rand = torch.rand(size=tensor_size, device=torch.device('cpu'))
 
+    ray_origins = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cpu'))
+    ray_dirs = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cpu'))
+    gt_rgb = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cpu'))
+    for i in range(train_num_rays):
+        img_idx=image_index[i]
+    
+        point_2d_x=x_rand[i]*colmap_data.all_width[img_idx]//1
+        point_2d_y=y_rand[i]*colmap_data.all_height[img_idx]//1
+       
+        #shift by 0.5 so we are in the center of the pixel
+        point_2d_x+=0.5
+        point_2d_y+=0.5
+
+
+
+        #get to cam coord by multiplying with the K inverse
+        fx=colmap_data.all_fx[img_idx]
+        fy=colmap_data.all_fy[img_idx]
+        cx=colmap_data.all_cx[img_idx]
+        cy=colmap_data.all_cy[img_idx]
+
+        point_cam_coord = np.array([[(point_2d_x - cx )/fx], \
+                                    [(point_2d_y - cy )/fy], \
+                                    [1.0]])
+
+
+        #get from cam coords to world coordinate
+        pixel_world_coord = colmap_data.all_c2w[img_idx][...,:3]@point_cam_coord
+        # t is the cam to world matrix, actually, it is the camera center
+        t = colmap_data.all_c2w[img_idx][...,-1:]
+        #get ray dir and origin
+        ray_dir=pixel_world_coord
+        ray_dir = ray_dir/np.linalg.norm(ray_dir)
+        ray_origin=t
+
+
+        #write everything to output
+        #origin
+        ray_origins[i]=torch.squeeze(ray_origin)
+       
+        #dir
+        ray_dirs[i]=torch.squeeze(ray_dir)
+
+        #gtrgb
+
+        gt_rgb_pixel = colmap_data.all_images[img_idx][int(point_2d_y), int(point_2d_x)]
+        gt_rgb[i]=gt_rgb_pixel
+        
+       
+    gt_mask = torch.ones((train_num_rays, 1), dtype=torch.float32, device=torch.device('cpu'))
+    return ray_origins, ray_dirs, gt_rgb, gt_mask, image_index
+def train(args, config_path, hyperparams, train_params, loader_train, experiment_name, with_viewer, checkpoint_path, tensor_reel, frames_train=None, hardcoded_cam_init=True, colmap_data=None):
+
+    
 
     #train
     if with_viewer:
@@ -263,6 +323,12 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
         bb_mesh = create_bb_mesh(aabb) 
         Scene.show(bb_mesh,"bb_mesh")
 
+
+    if with_viewer:
+        for i,frame in enumerate(frames_train):
+            frustum_mesh=frame.create_frustum_mesh(scale_multiplier=0.06)
+            Scene.show(frustum_mesh, "my_frustum_mesh_"+str(i))
+
     cb=create_callbacks(with_viewer, train_params, experiment_name, config_path)
 
 
@@ -278,7 +344,11 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
     model_bg=NerfHash(4, boundary_primitive=aabb, nr_iters_for_c2f=hyperparams.background_nr_iters_for_c2f ).to("cuda") 
     if hyperparams.use_color_calibration:
         # model_colorcal=Colorcal(loader_train.nr_samples(), 0)
-        model_colorcal=Colorcal(tensor_reel.rgb_reel.shape[0], 0)
+        if tensor_reel:
+            model_colorcal=Colorcal(tensor_reel.rgb_reel.shape[0], 0)
+
+        if colmap_data:
+            model_colorcal=Colorcal(len(colmap_data.all_c2w), 0)
     else:
         model_colorcal=None
     if hyperparams.use_occupancy_grid:
@@ -333,9 +403,19 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
                 cos_anneal_ratio=map_range_val(iter_nr_for_anneal, 0.0, hyperparams.forced_variance_finish_iter, 0.0, 1.0)
                 forced_variance=map_range_val(iter_nr_for_anneal, 0.0, hyperparams.forced_variance_finish_iter, 0.3, hyperparams.forced_variance_finish)
 
-                #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cuda")
-                ray_origins, ray_dirs, gt_selected, gt_mask, img_indices=PermutoSDF.random_rays_from_reel(tensor_reel, nr_rays_to_create) 
-                #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cpu")
+                #print(f"nr_rays_to_create:{nr_rays_to_create}")
+                if colmap_data is not None:
+                    ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays(colmap_data, nr_rays_to_create)
+                    
+                    ray_origins = ray_origins.to("cuda")
+                    ray_dirs = ray_dirs.to("cuda")
+                    gt_selected = gt_selected.to("cuda")
+                    gt_mask = gt_mask.to("cuda")
+                    img_indices = img_indices.to("cuda")
+                else:
+                    #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cuda")
+                    ray_origins, ray_dirs, gt_selected, gt_mask, img_indices=PermutoSDF.random_rays_from_reel(tensor_reel, nr_rays_to_create) 
+                    #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cpu")
 
                 ray_points_entry, ray_t_entry, ray_points_exit, ray_t_exit, does_ray_intersect_box=aabb.ray_intersection(ray_origins, ray_dirs)
 
@@ -469,11 +549,15 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
                 vis_width=300
                 vis_height=300
                 if first_time_getting_control or ngp_gui.m_control_view:
-                    first_time_getting_control=False
-                    frame=Frame()
-                    frame.from_camera(view.m_camera, vis_width, vis_height)
-                    frustum_mesh=frame.create_frustum_mesh(0.1)
-                    Scene.show(frustum_mesh,"frustum_mesh_vis")
+                    if False:# or colmap_data is not None:
+                        frame=random.choice(colmap_data.frames)
+                    else:
+                        first_time_getting_control=False
+                        frame=Frame()
+                        frame.from_camera(view.m_camera, vis_width, vis_height)
+                        frustum_mesh=frame.create_frustum_mesh(0.1)
+                        Scene.show(frustum_mesh,"frustum_mesh_vis")
+
 
                 #forward all the pixels
                 ray_origins, ray_dirs=create_rays_from_frame(frame, rand_indices=None) # ray origins and dirs as nr_pixels x 3
@@ -509,6 +593,8 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
                     frame=random.choice(frames_train)
                 else:
                     frame=phase.loader.get_random_frame() #we just get this frame so that the tensorboard can render from this frame
+                if colmap_data is not None:
+                    frame=random.choice(colmap_data.frames)
 
                 #make from the gt frame a smaller frame until we reach a certain size
                 frame_subsampled=frame.subsample(2.0, subsample_imgs=False)

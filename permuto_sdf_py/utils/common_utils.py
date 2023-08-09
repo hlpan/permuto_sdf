@@ -522,6 +522,7 @@ def create_bb_for_dataset(dataset_name):
     else:
         print("Using default sphere of radius 0.5")
         aabb=Sphere(0.5, [0,0,0])
+        #aabb=Sphere(2.0, [0.31,1.78,1.72])
         # print("UNKOWN datasetname in create_bb_for_dataset")
         # exit(1)
 

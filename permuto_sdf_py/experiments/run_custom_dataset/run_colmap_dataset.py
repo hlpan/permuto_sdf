@@ -18,16 +18,22 @@ from dataloaders import *
 import permuto_sdf
 from permuto_sdf  import TrainParams
 from permuto_sdf_py.utils.common_utils import create_dataloader
+from permuto_sdf_py.utils.common_utils import create_bb_mesh
 from permuto_sdf_py.utils.permuto_sdf_utils import get_frames_cropped
 from permuto_sdf_py.train_permuto_sdf import train
 from permuto_sdf_py.train_permuto_sdf import HyperParamsPermutoSDF
 import permuto_sdf_py.paths.list_of_training_scenes as list_scenes
+from permuto_sdf import NGPGui
 
 from dataloaders import *
 from permuto_sdf  import Sphere
 torch.manual_seed(0)
 torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
+from PIL import Image
+import torchvision.transforms.functional as TF
+from colmap_utils import \
+    read_cameras_binary, read_images_binary, read_points3d_binary
 
 parser = argparse.ArgumentParser(description='Train sdf and color')
 parser.add_argument('--dataset', default="custom", help='Dataset name which can also be custom in which case the user has to provide their own data')
@@ -35,7 +41,7 @@ parser.add_argument('--dataset_path', default="/media/rosu/Data/data/permuto_sdf
 parser.add_argument('--with_mask', action='store_true', help="Set this to true in order to train with a mask")
 parser.add_argument('--exp_info', default="", help='Experiment info string useful for distinguishing one experiment for another')
 parser.add_argument('--no_viewer', action='store_true', help="Set this to true in order disable the viewer")
-parser.add_argument('--scene_scale', default=0.9, type=float, help='Scale of the scene so that it fits inside the unit sphere')
+parser.add_argument('--scene_scale', default=1.0, type=float, help='Scale of the scene so that it fits inside the unit sphere')
 parser.add_argument('--scene_translation', default=[0,0,0], type=float, nargs=3, help='Translation of the scene so that it fits inside the unit sphere')
 parser.add_argument('--img_subsample', default=1.0, type=float, help="The higher the subsample value, the smaller the images are. Useful for low vram")
 args = parser.parse_args()
@@ -45,6 +51,8 @@ with_viewer=not args.no_viewer
 #MODIFY these for your dataset!
 SCENE_SCALE=args.scene_scale
 SCENE_TRANSLATION=args.scene_translation
+SCENE_SCALE=0.25
+SCENE_TRANSLATION=[0.11903904248331793,0.24058634782431088,0.19656414617581808]
 IMG_SUBSAMPLE_FACTOR=args.img_subsample #subsample the image to lower resolution in case you are running on a low VRAM GPU. The higher this number, the smaller the images
 DATASET_PATH=args.dataset_path #point this to wherever you downloaded the easypbr_data (see README.md for download link)
  
@@ -131,7 +139,175 @@ def create_custom_dataset():
     
     return frames
 
+class ColmapData():
 
+    def __init__(self, root_dir, img_downscale):
+        "read colmap dataset"
+        camdata = read_cameras_binary(os.path.join(root_dir, 'sparse/0/cameras.bin'))
+        imdata = read_images_binary(os.path.join(root_dir, 'sparse/0/images.bin'))
+
+        
+        all_width, all_height, all_fx, all_fy, all_cx, all_cy = [], [], [], [], [], []
+        all_c2w, all_images = [], []
+        frames = []
+        #camera to world coordinate
+        #intrinsic, fx, fy, width, height
+        cam_poses = torch.empty(size=(len(imdata.values()),3), dtype=torch.float32, device=torch.device('cpu'))
+        for i, d in enumerate(imdata.values()):
+            # if i > 0:
+            #     continue
+            R = d.qvec2rotmat()
+            t = d.tvec.reshape(3, 1)
+
+            cam_pos = -R.T@t
+            cam_pos = cam_pos-np.array(SCENE_TRANSLATION).reshape(3,1)
+            cam_pos = cam_pos*SCENE_SCALE
+            c2w = torch.from_numpy(np.concatenate([R.T, cam_pos], axis=1)).float()
+            #c2w[:,1:2] *= -1. # COLMAP => OpenGL
+            all_c2w.append(c2w)
+
+            camera = camdata[d.camera_id]
+
+            img_width = int(camera.width* img_downscale)
+            img_height= int(camera.height* img_downscale)
+            all_width.append(img_width)
+            all_height.append(img_height)
+
+            # TODO scale
+            if camera.model == 'SIMPLE_RADIAL':
+                fx = fy = camera.params[0] * img_downscale
+                cx = camera.params[1] * img_downscale
+                cy = camera.params[2] * img_downscale
+            elif camera.model in ['PINHOLE', 'OPENCV']:
+                fx = camera.params[0] * img_downscale
+                fy = camera.params[1] * img_downscale
+                cx = camera.params[2] * img_downscale
+                cy = camera.params[3] * img_downscale
+            else:
+                raise ValueError(f"Please parse the intrinsics for camera model {camdata[1].model}!")
+
+            all_fx.append(fx)
+            all_fy.append(fy)
+            all_cx.append(cx)
+            all_cy.append(cy)
+
+            img_path = os.path.join(root_dir, "images", d.name)
+            img = Image.open(img_path)
+            
+            if img_downscale != 1:
+                img = img.resize(size=(img_width, img_height))
+
+            img = TF.to_tensor(img).permute(1, 2, 0)[...,:3]
+            
+        
+            all_images.append(img)
+
+
+            frame=Frame()
+
+            #img_size
+            frame.width=int(camera.width* img_downscale)
+            frame.height=int(camera.height* img_downscale)
+
+            #intrinsics as fx, fy, cx, cy
+            K=np.identity(3)
+            K[0][0]=fx
+            K[1][1]=fy
+            K[0][2]=cx
+            K[1][2]=cy
+            frame.K=K
+
+            
+
+            b = torch.tensor([[0, 0, 0, 1]], device='cpu')
+            c = torch.cat((c2w, b), dim=0)
+            frame.tf_cam_world.from_matrix(c)
+            frame.tf_cam_world = frame.tf_cam_world.inverse()
+
+            # img=Mat(os.path.join(root_dir, "images", d.name))
+
+            #frame.rgb_32f.from_numpy(img.numpy())
+            img=Mat(img_path)
+            img=img.to_cv32f()
+            #get rgb part and possibly the alpha as a mask
+            if img.channels()==4:
+                img_rgb=img.rgba2rgb()
+            else:
+                img_rgb=img
+            #get the alpha a a mask if necessary
+            if args.with_mask and img.channels()==4:
+                img_mask=img.get_channel(3)
+                frame.mask=img_mask
+            if args.with_mask and not img.channels()==4:
+                exit("You are requiring to use a foreground-background mask which should be in the alpha channel of the image. But the image does not have 4 channels")
+            frame.rgb_32f=img_rgb 
+
+
+            #extrinsics as a tf_cam_world (transformation that maps from world to camera coordiantes)
+            #tf_cam_world=Affine3f()
+
+            # in colmap the quaternion is expressed as [qw, qx,qy,qz]
+            # in eigen the quaternion is expressed as [qx,qy,qz,qw]
+            # qw, qx,qy,qz = d.qvec
+            # tf_cam_world.set_quat(np.array([qx,qy,qz,qw]))
+            # tf_cam_world.set_translation(t)
+            # frame.tf_cam_world=tf_cam_world
+
+
+            # ALTERNATIVELLY if you have already the extrinsics as a numpy matrix you can use the following line
+            #frame.tf_cam_world.from_matrix(YOUR_4x4_TF_CAM_WORLD_NUMPY_MATRIX) 
+
+            #scale scene so that the object of interest is within a sphere at the origin with radius 0.5
+            # tf_world_cam_rescaled = frame.tf_cam_world.inverse()
+            # translation=tf_world_cam_rescaled.translation().copy()
+            # translation*=SCENE_SCALE
+            # translation+=SCENE_TRANSLATION
+            # tf_world_cam_rescaled.set_translation(translation)
+            # frame.tf_cam_world=tf_world_cam_rescaled.inverse()
+
+            # #subsample the image to lower resolution in case you are running on a low VRAM GPU
+            # frame=frame.subsample(IMG_SUBSAMPLE_FACTOR)
+
+            #append to the scene so the frustums are visualized if the viewer is enabled
+            # frustum_mesh=frame.create_frustum_mesh(scale_multiplier=0.06)
+            # Scene.show(frustum_mesh, "frustum_mesh_"+str(i))
+
+            #finish
+            frames.append(frame)
+
+            #cam_pos[i] = c2w[..., -1:]
+
+        self.frames = frames
+        self.all_images = all_images
+        self.all_c2w = torch.stack(all_c2w, dim=0)   
+        self.all_width = torch.tensor(all_width, device=torch.device('cpu'))   
+        self.all_height = torch.tensor(all_height, device=torch.device('cpu'))   
+        self.all_fx = torch.tensor(all_fx, device=torch.device('cpu'))   
+        self.all_fy = torch.tensor(all_fy, device=torch.device('cpu'))   
+        self.all_cx = torch.tensor(all_cx, device=torch.device('cpu'))   
+        self.all_cy = torch.tensor(all_cy, device=torch.device('cpu'))   
+
+        pts3d = read_points3d_binary(os.path.join(root_dir, 'sparse/0/points3D.bin'))
+        pts3d = np.array([pts3d[k].xyz for k in pts3d])
+        pts3d = pts3d - SCENE_TRANSLATION
+        pts3d = pts3d*SCENE_SCALE
+
+        points_mesh=Mesh()
+        points_mesh.V=pts3d
+        points_mesh.m_vis.m_show_points = True
+        points_mesh.m_vis.m_point_color = [0.1, 0.9, 0.1]
+        Scene.show(points_mesh, "colmap_points")
+
+        pos_mesh=Mesh()
+        pos_mesh.V=self.all_c2w[...,-1]
+        pos_mesh.m_vis.m_show_points = True
+        Scene.show(pos_mesh, "cam_points")
+
+        #aabb=Sphere(2.0, [0.31,1.78,1.72])
+        aabb=Sphere(0.5, [0,0,0])
+        bb_mesh = create_bb_mesh(aabb) 
+        bb_mesh.m_vis.m_line_color = [0.1, 0.9, 0.1]
+        Scene.show(bb_mesh,"my_bb_mesh")
 
 def run():
 
@@ -161,9 +337,9 @@ def run():
     #CREATE CUSTOM DATASET---------------------------
     #frames=create_custom_dataset() 
 
-    loader_train=DataLoaderColmap(config_path)
-    loader_train.set_mode_train()
-    loader_train.start()
+    # loader_train=DataLoaderColmap(config_path)
+    # loader_train.set_mode_train()
+    # loader_train.start()
     #print the scale of the scene which contains all the cameras.
     print("scene centroid", Scene.get_centroid()) #aproximate center of our scene which consists of all frustum of the cameras
     print("scene scale", Scene.get_scale()) #how big the scene is as a measure betwen the min and max of call cameras positions
@@ -178,13 +354,17 @@ def run():
     #tensor_reel=MiscDataFuncs.frames2tensors(frames) #make an tensorreel and get rays from all the images at 
 
     #tensoreel
-    all_frame = []
-    for i in range(loader_train.nr_samples()):
-        all_frame.append(loader_train.get_frame_at_idx(i))
-    tensor_reel=MiscDataFuncs.frames2tensors( all_frame ) #make an tensorreel and get rays from all the images at
+    # all_frame = []
+    # for i in range(loader_train.nr_samples()):
+    #     all_frame.append(loader_train.get_frame_at_idx(i))
+    # tensor_reel=MiscDataFuncs.frames2tensors( all_frame ) #make an tensorreel and get rays from all the images at
 
-
-    train(args, config_path, hyperparams, train_params, None, experiment_name, with_viewer, checkpoint_path, tensor_reel, frames_train=all_frame, hardcoded_cam_init=False)
+    #colmap_dataset = ColmapData("/workspace/home/nerf-data/tanksandtemple/Truck/dense/", 1)
+    #colmap_dataset = ColmapData("/workspace/home/nerf-data/germany/dense/", 0.1)
+    colmap_dataset = ColmapData("/workspace/home/nerf-data/tanksandtemple/Ignatius2/dense/", 1)
+    #tensor_reels=MiscDataFuncs.frames2tensors(colmap_dataset.frames)
+    tensor_reels = None
+    train(args, config_path, hyperparams, train_params, None, experiment_name, with_viewer, checkpoint_path, tensor_reel=tensor_reels, frames_train=colmap_dataset.frames, hardcoded_cam_init=False, colmap_data=colmap_dataset)
 
 
 
@@ -194,7 +374,16 @@ def main():
 
 
 if __name__ == "__main__":
-     main()  # This is what you would have, but the following is useful:
+    # config_file="train_permuto_sdf.cfg"
+    # config_path=os.path.join( os.path.dirname( os.path.realpath(__file__) ) , '../../../config', config_file)
+    # view=Viewer.create(config_path)
+    # ngp_gui=NGPGui.create(view)
+    # colmap_dataset = ColmapData("/workspace/home/nerf-data/germany/dense/", 1)
+
+    # while(True):
+    #     view.update()
+    # pass
+    main()  # This is what you would have, but the following is useful:
 
     # # These are temporary, for debugging, so meh for programming style.
     # import sys, trace

@@ -37,7 +37,8 @@ datasets={
         "bmvs_man"
      },
     "blender":{
-        "Ignatius"
+        #"Ignatius"
+        "Truck"
      },
     "multiface":{
         "0",  
