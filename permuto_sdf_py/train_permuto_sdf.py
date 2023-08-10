@@ -303,9 +303,45 @@ def get_colmap_rays(colmap_data, train_num_rays = 512):
        
     gt_mask = torch.ones((train_num_rays, 1), dtype=torch.float32, device=torch.device('cpu'))
     return ray_origins, ray_dirs, gt_rgb, gt_mask, image_index
+
+
+def get_colmap_rays2(colmap_data, train_num_rays = 512):
+    "get train_num_rays random rays from colmap dataset"
+
+    #tensor_size = size=(train_num_rays,)
+    image_index = torch.randint(0, len(colmap_data.all_C), size=(train_num_rays,), device=torch.device('cuda:0'))
+    xy_rand = torch.rand(size=(train_num_rays,2,1), device=torch.device('cuda:0'))
+    point_2d =(xy_rand*colmap_data.all_size[image_index])//1
+    pixel_2d = point_2d.int().to('cpu').squeeze()
+    
+    point_2d = (point_2d+0.5-colmap_data.all_cxy[image_index])/colmap_data.all_fxy[image_index]
+
+    one_tensor = torch.ones_like(point_2d[:,:1,:])
+    point_3d = torch.cat((point_2d, one_tensor), dim=1)
+    point_3d = colmap_data.all_R[image_index]@point_3d
+    point_3d = F.normalize(point_3d, dim=1)
+    ray_dirs = point_3d.squeeze()
+
+
+    #ray_origins = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cuda:0'))
+    #ray_dirs = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cuda:0'))
+    image_index_cpu = image_index.to('cpu')
+    #T1 = time.time()
+    gt_rgb = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cpu'))
+
+    for i in range(train_num_rays):
+        x,y = pixel_2d[i]
+        gt_rgb_pixel = colmap_data.all_images[image_index_cpu[i]][y, x]
+        gt_rgb[i]=gt_rgb_pixel
+
+    # T2 = time.time()
+    # print(f'rays:{train_num_rays} time: {((T2 - T1)*1000)} ms')
+       
+    gt_mask = torch.ones((train_num_rays, 1), dtype=torch.float32, device=torch.device('cuda:0'))
+    return colmap_data.all_C[image_index].squeeze(), ray_dirs.squeeze(), gt_rgb.to('cuda:0'), gt_mask, image_index
 def train(args, config_path, hyperparams, train_params, loader_train, experiment_name, with_viewer, checkpoint_path, tensor_reel, frames_train=None, hardcoded_cam_init=True, colmap_data=None):
 
-    
+    #ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays2(colmap_data)
 
     #train
     if with_viewer:
@@ -348,7 +384,7 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
             model_colorcal=Colorcal(tensor_reel.rgb_reel.shape[0], 0)
 
         if colmap_data:
-            model_colorcal=Colorcal(len(colmap_data.all_c2w), 0)
+            model_colorcal=Colorcal(len(colmap_data.all_C), 0)
     else:
         model_colorcal=None
     if hyperparams.use_occupancy_grid:
@@ -405,13 +441,14 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
 
                 #print(f"nr_rays_to_create:{nr_rays_to_create}")
                 if colmap_data is not None:
-                    ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays(colmap_data, nr_rays_to_create)
+                    # ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays(colmap_data, nr_rays_to_create)
                     
-                    ray_origins = ray_origins.to("cuda")
-                    ray_dirs = ray_dirs.to("cuda")
-                    gt_selected = gt_selected.to("cuda")
-                    gt_mask = gt_mask.to("cuda")
-                    img_indices = img_indices.to("cuda")
+                    # ray_origins = ray_origins.to("cuda")
+                    # ray_dirs = ray_dirs.to("cuda")
+                    # gt_selected = gt_selected.to("cuda")
+                    # gt_mask = gt_mask.to("cuda")
+                    # img_indices = img_indices.to("cuda")
+                    ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays2(colmap_data, nr_rays_to_create)
                 else:
                     #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cuda")
                     ray_origins, ray_dirs, gt_selected, gt_mask, img_indices=PermutoSDF.random_rays_from_reel(tensor_reel, nr_rays_to_create) 

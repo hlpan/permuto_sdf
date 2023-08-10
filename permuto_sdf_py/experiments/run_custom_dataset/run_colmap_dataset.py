@@ -147,8 +147,10 @@ class ColmapData():
         imdata = read_images_binary(os.path.join(root_dir, 'sparse/0/images.bin'))
 
         
-        all_width, all_height, all_fx, all_fy, all_cx, all_cy = [], [], [], [], [], []
-        all_c2w, all_images = [], []
+        all_size, all_fxy, all_cxy = [], [], []
+        all_R = []
+        all_C = []
+        all_images = []
         frames = []
         #camera to world coordinate
         #intrinsic, fx, fy, width, height
@@ -162,16 +164,17 @@ class ColmapData():
             cam_pos = -R.T@t
             cam_pos = cam_pos-np.array(SCENE_TRANSLATION).reshape(3,1)
             cam_pos = cam_pos*SCENE_SCALE
-            c2w = torch.from_numpy(np.concatenate([R.T, cam_pos], axis=1)).float()
+            #c2w = torch.from_numpy(np.concatenate([R.T, cam_pos], axis=1)).float()
             #c2w[:,1:2] *= -1. # COLMAP => OpenGL
-            all_c2w.append(c2w)
+            all_R.append(torch.tensor(R.T, dtype=torch.float32, device='cpu'))
+            all_C.append(torch.tensor(cam_pos, dtype=torch.float32, device='cpu'))
 
             camera = camdata[d.camera_id]
 
             img_width = int(camera.width* img_downscale)
             img_height= int(camera.height* img_downscale)
-            all_width.append(img_width)
-            all_height.append(img_height)
+            all_size.append(torch.tensor([[img_width], [img_height]], dtype=torch.int32, device='cpu'))
+            
 
             # TODO scale
             if camera.model == 'SIMPLE_RADIAL':
@@ -186,10 +189,9 @@ class ColmapData():
             else:
                 raise ValueError(f"Please parse the intrinsics for camera model {camdata[1].model}!")
 
-            all_fx.append(fx)
-            all_fy.append(fy)
-            all_cx.append(cx)
-            all_cy.append(cy)
+            all_fxy.append(torch.tensor([[fx],[fy]], dtype=torch.float32, device='cpu'))
+          
+            all_cxy.append(torch.tensor([[cx],[cy]], dtype=torch.float32, device='cpu'))
 
             img_path = os.path.join(root_dir, "images", d.name)
             img = Image.open(img_path)
@@ -219,8 +221,8 @@ class ColmapData():
 
             
 
-            b = torch.tensor([[0, 0, 0, 1]], device='cpu')
-            c = torch.cat((c2w, b), dim=0)
+            b = torch.tensor([[0, 0, 0, 1]], dtype=torch.float32, device='cpu')
+            c = torch.cat( (torch.tensor(np.concatenate([R.T, cam_pos], axis=1), dtype=torch.float32, device='cpu'), b), dim=0)
             frame.tf_cam_world.from_matrix(c)
             frame.tf_cam_world = frame.tf_cam_world.inverse()
 
@@ -279,13 +281,16 @@ class ColmapData():
 
         self.frames = frames
         self.all_images = all_images
-        self.all_c2w = torch.stack(all_c2w, dim=0)   
-        self.all_width = torch.tensor(all_width, device=torch.device('cpu'))   
-        self.all_height = torch.tensor(all_height, device=torch.device('cpu'))   
-        self.all_fx = torch.tensor(all_fx, device=torch.device('cpu'))   
-        self.all_fy = torch.tensor(all_fy, device=torch.device('cpu'))   
-        self.all_cx = torch.tensor(all_cx, device=torch.device('cpu'))   
-        self.all_cy = torch.tensor(all_cy, device=torch.device('cpu'))   
+
+        #rotation from camera to world
+        self.all_R = torch.stack(all_R, dim=0).to('cuda:0')   
+
+        #camera pos
+        self.all_C = torch.stack(all_C, dim=0).to('cuda:0')   
+
+        self.all_size = torch.stack(all_size, dim=0).to('cuda:0')      
+        self.all_fxy = torch.stack(all_fxy, dim=0).to('cuda:0')      
+        self.all_cxy = torch.stack(all_cxy, dim=0).to('cuda:0')      
 
         pts3d = read_points3d_binary(os.path.join(root_dir, 'sparse/0/points3D.bin'))
         pts3d = np.array([pts3d[k].xyz for k in pts3d])
@@ -299,7 +304,7 @@ class ColmapData():
         Scene.show(points_mesh, "colmap_points")
 
         pos_mesh=Mesh()
-        pos_mesh.V=self.all_c2w[...,-1]
+        pos_mesh.V=self.all_C.cpu().numpy().squeeze()
         pos_mesh.m_vis.m_show_points = True
         Scene.show(pos_mesh, "cam_points")
 
