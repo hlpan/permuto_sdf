@@ -45,7 +45,8 @@ ckpts={
     "blender_with_mask_False":
     {
         #"Ignatius":"custom_dataset/custom_Ignatius/200000"
-        "Truck":"custom_dataset/custom_Truck/200000"
+        #"Truck":"custom_dataset/custom_Truck/200000"
+        "Barn":"custom_dataset/custom_colmap_Barn/400000"
     }
 
 

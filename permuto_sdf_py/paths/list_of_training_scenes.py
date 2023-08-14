@@ -38,7 +38,8 @@ datasets={
      },
     "blender":{
         #"Ignatius"
-        "Truck"
+        #"Truck"
+        "Barn"
      },
     "multiface":{
         "0",  

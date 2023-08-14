@@ -58,6 +58,8 @@ from permuto_sdf_py.utils.permuto_sdf_utils import eikonal_loss
 from permuto_sdf_py.utils.permuto_sdf_utils import module_exists
 from permuto_sdf_py.utils.aabb import AABB
 from permuto_sdf_py.callbacks.callback_utils import *
+from permuto_sdf_py.utils.sdf_utils import extract_mesh_from_sdf_model
+
 if module_exists("apex"):
     import apex
     has_apex=True
@@ -108,13 +110,69 @@ hyperparams=HyperParamsPermutoSDF()
 
 
 
+def generate_samples(args, hyperparams, ray_origins, ray_dirs, model_sdf, occupancy_grid, iter_nr_for_anneal):
+    with torch.set_grad_enabled(False):
+        ray_points_entry, ray_t_entry, ray_points_exit, ray_t_exit, does_ray_intersect_box=model_sdf.boundary_primitive.ray_intersection(ray_origins, ray_dirs)
+        TIME_START("create_samples")
+        fg_ray_samples_packed, bg_ray_samples_packed = create_samples(args, hyperparams, ray_origins, ray_dirs, model_sdf.training, occupancy_grid, model_sdf.boundary_primitive)
+        if hyperparams.do_importance_sampling and fg_ray_samples_packed.samples_pos.shape[0]!=0:
+            fg_ray_samples_packed=importance_sampling_sdf_model(model_sdf, fg_ray_samples_packed, ray_origins, ray_dirs, ray_t_exit, iter_nr_for_anneal)
+        TIME_END("create_samples") #4ms in PermutoSDF
+
+        return fg_ray_samples_packed, bg_ray_samples_packed
+def run_net2(args, ray_origins, img_indices, model_sdf, model_rgb, model_bg, model_colorcal, iter_nr_for_anneal,  cos_anneal_ratio, forced_variance, fg_ray_samples_packed, bg_ray_samples_packed):
+    #TIME_START("render_fg")    
+    if fg_ray_samples_packed.samples_pos.shape[0]==0: #if we actualyl have samples for this batch fo rays
+        pred_rgb=torch.zeros_like(ray_origins)
+        pred_normals=torch.zeros_like(ray_origins)
+        sdf_gradients=torch.zeros_like(ray_origins)
+        weights_sum=torch.zeros_like(ray_origins)[:,0:1]
+        bg_transmittance=torch.ones_like(ray_origins)[:,0:1]
+    else:
+        #foreground 
+        #get sdf
+        sdf, sdf_gradients, geom_feat=model_sdf.get_sdf_and_gradient(fg_ray_samples_packed.samples_pos, iter_nr_for_anneal)
+        #get rgb
+        rgb_samples = model_rgb( fg_ray_samples_packed.samples_pos, fg_ray_samples_packed.samples_dirs, sdf_gradients, geom_feat, iter_nr_for_anneal, model_colorcal, img_indices, fg_ray_samples_packed.ray_start_end_idx)
+        #volumetric integration
+        weights, weights_sum, bg_transmittance, inv_s = model_rgb.volume_renderer_neus.compute_weights(fg_ray_samples_packed, sdf, sdf_gradients, cos_anneal_ratio, forced_variance) #neus
+        pred_rgb=model_rgb.volume_renderer_neus.integrate(fg_ray_samples_packed, rgb_samples, weights)
+
+        #compute also normal by integrating the gradient
+        grad_integrated_per_ray=model_rgb.volume_renderer_neus.integrate(fg_ray_samples_packed, sdf_gradients, weights)
+        pred_normals=F.normalize(grad_integrated_per_ray, dim=1)
+    #TIME_END("render_fg") #7.2ms in PermutoSDF   
+
+
+
+    # print("bg_ray_samples_packed.samples_pos_4d",bg_ray_samples_packed.samples_pos_4d)
+
+    TIME_START("render_bg")    
+    #run nerf bg
+    if args.with_mask:
+        pred_rgb_bg=None
+    # else: #have to model the background
+    elif bg_ray_samples_packed.samples_pos_4d.shape[0]!=0: #have to model the background
+        #compute rgb and density
+        rgb_samples_bg, density_samples_bg=model_bg( bg_ray_samples_packed.samples_pos_4d, bg_ray_samples_packed.samples_dirs, iter_nr_for_anneal, model_colorcal, img_indices, ray_start_end_idx=bg_ray_samples_packed.ray_start_end_idx) 
+        #volumetric integration
+        weights_bg, weight_sum_bg, _= model_bg.volume_renderer_nerf.compute_weights(bg_ray_samples_packed, density_samples_bg.view(-1,1))
+        pred_rgb_bg=model_bg.volume_renderer_nerf.integrate(bg_ray_samples_packed, rgb_samples_bg, weights_bg)
+        #combine
+        pred_rgb_bg = bg_transmittance.view(-1,1) * pred_rgb_bg
+        pred_rgb = pred_rgb + pred_rgb_bg
+    TIME_END("render_bg")    
+
+    # return pred_rgb, sdf_gradients, weights, weights_sum, fg_ray_samples_packed
+    return pred_rgb, pred_rgb_bg, pred_normals, sdf_gradients, weights_sum
+
 
 def run_net(args, hyperparams, ray_origins, ray_dirs, img_indices, model_sdf, model_rgb, model_bg, model_colorcal, occupancy_grid, iter_nr_for_anneal,  cos_anneal_ratio, forced_variance):
     with torch.set_grad_enabled(False):
         ray_points_entry, ray_t_entry, ray_points_exit, ray_t_exit, does_ray_intersect_box=model_sdf.boundary_primitive.ray_intersection(ray_origins, ray_dirs)
         TIME_START("create_samples")
         fg_ray_samples_packed, bg_ray_samples_packed = create_samples(args, hyperparams, ray_origins, ray_dirs, model_sdf.training, occupancy_grid, model_sdf.boundary_primitive)
-        
+
         if hyperparams.do_importance_sampling and fg_ray_samples_packed.samples_pos.shape[0]!=0:
             fg_ray_samples_packed=importance_sampling_sdf_model(model_sdf, fg_ray_samples_packed, ray_origins, ray_dirs, ray_t_exit, iter_nr_for_anneal)
         TIME_END("create_samples") #4ms in PermutoSDF
@@ -328,21 +386,57 @@ def get_colmap_rays2(colmap_data, train_num_rays = 512):
     image_index_cpu = image_index.to('cpu')
     #T1 = time.time()
     gt_rgb = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cpu'))
-
+    TIME_START("rgb_copy")
     for i in range(train_num_rays):
         x,y = pixel_2d[i]
         gt_rgb_pixel = colmap_data.all_images[image_index_cpu[i]][y, x]
         gt_rgb[i]=gt_rgb_pixel
-
+    TIME_END("rgb_copy")
     # T2 = time.time()
     # print(f'rays:{train_num_rays} time: {((T2 - T1)*1000)} ms')
        
     gt_mask = torch.ones((train_num_rays, 1), dtype=torch.float32, device=torch.device('cuda:0'))
     return colmap_data.all_C[image_index].squeeze(), ray_dirs.squeeze(), gt_rgb.to('cuda:0'), gt_mask, image_index
+
+
+def get_colmap_rays_cpu(colmap_data, train_num_rays = 512):
+    "get train_num_rays random rays from colmap dataset"
+
+    TIME_START("cam_compute")
+    image_index = torch.randint(0, len(colmap_data.all_C), size=(train_num_rays,), device=torch.device('cpu'))
+    xy_rand = torch.rand(size=(train_num_rays,2,1), device=torch.device('cpu'))
+    point_2d =(xy_rand*colmap_data.all_size[image_index])//1
+    pixel_2d = point_2d.int().squeeze()
+    
+    point_2d = (point_2d+0.5-colmap_data.all_cxy[image_index])/colmap_data.all_fxy[image_index]
+
+    one_tensor = torch.ones_like(point_2d[:,:1,:])
+    point_3d = torch.cat((point_2d, one_tensor), dim=1)
+    point_3d = colmap_data.all_R[image_index]@point_3d
+    point_3d = F.normalize(point_3d, dim=1)
+    ray_dirs = point_3d.squeeze()
+
+    #T1 = time.time()
+    gt_rgb = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cpu'))
+    TIME_END("cam_compute")
+    TIME_START("rgb_copy")
+    for i in range(train_num_rays):
+        x,y = pixel_2d[i]
+        gt_rgb_pixel = colmap_data.all_images[image_index[i]][y, x]
+        gt_rgb[i]=gt_rgb_pixel
+    TIME_END("rgb_copy")
+    # T2 = time.time()
+    # print(f'rays:{train_num_rays} time: {((T2 - T1)*1000)} ms')
+       
+    gt_mask = torch.ones((train_num_rays, 1), dtype=torch.float32, device=torch.device('cuda:0'))
+    return colmap_data.all_C[image_index].squeeze().to('cuda:0'), ray_dirs.squeeze().to('cuda:0'), gt_rgb.to('cuda:0'), gt_mask, image_index.to('cuda:0')
+
+
 def train(args, config_path, hyperparams, train_params, loader_train, experiment_name, with_viewer, checkpoint_path, tensor_reel, frames_train=None, hardcoded_cam_init=True, colmap_data=None):
 
-    #ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays2(colmap_data)
-
+    #ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays_cpu(colmap_data)
+    
+    
     #train
     if with_viewer:
         view=Viewer.create(config_path)
@@ -413,7 +507,7 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
     first_time_getting_control=True
     is_in_training_loop=True
     nr_rays_to_create=hyperparams.nr_rays
-   
+    colmap_data.thread_start_gen_rays(nr_rays_to_create)
     while is_in_training_loop:
         model_sdf.train(phase.grad)
         model_rgb.train(phase.grad)
@@ -439,6 +533,8 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
                 cos_anneal_ratio=map_range_val(iter_nr_for_anneal, 0.0, hyperparams.forced_variance_finish_iter, 0.0, 1.0)
                 forced_variance=map_range_val(iter_nr_for_anneal, 0.0, hyperparams.forced_variance_finish_iter, 0.3, hyperparams.forced_variance_finish)
 
+                #torch.cuda.synchronize()
+                #TIME_START("ray_gen")
                 #print(f"nr_rays_to_create:{nr_rays_to_create}")
                 if colmap_data is not None:
                     # ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays(colmap_data, nr_rays_to_create)
@@ -448,22 +544,45 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
                     # gt_selected = gt_selected.to("cuda")
                     # gt_mask = gt_mask.to("cuda")
                     # img_indices = img_indices.to("cuda")
-                    ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays2(colmap_data, nr_rays_to_create)
+                    #ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays_cpu(colmap_data, nr_rays_to_create)
+                    colmap_data.thread_end_gen_rays()
+                    #colmap_data.get_rays()
+                    (ray_origins, ray_dirs, gt_selected, gt_mask, img_indices) = colmap_data.train_data
                 else:
-                    #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cuda")
                     ray_origins, ray_dirs, gt_selected, gt_mask, img_indices=PermutoSDF.random_rays_from_reel(tensor_reel, nr_rays_to_create) 
-                    #tensor_reel.rgb_reel = tensor_reel.rgb_reel.to("cpu")
 
+                #torch.cuda.synchronize()
+                #TIME_END("ray_gen")
                 ray_points_entry, ray_t_entry, ray_points_exit, ray_t_exit, does_ray_intersect_box=aabb.ray_intersection(ray_origins, ray_dirs)
 
 
+            # fg_ray_samples_packed, bg_ray_samples_packed = generate_samples(args, hyperparams, ray_origins, ray_dirs, model_sdf, occupancy_grid, iter_nr_for_anneal)
+
+            # with torch.set_grad_enabled(False):
+            #     ray_points_entry, ray_t_entry, ray_points_exit, ray_t_exit, does_ray_intersect_box=model_sdf.boundary_primitive.ray_intersection(ray_origins, ray_dirs)
+            #     fg_ray_samples_packed, bg_ray_samples_packed = create_samples(args, hyperparams, ray_origins, ray_dirs, model_sdf.training, occupancy_grid, model_sdf.boundary_primitive)
+            #     if hyperparams.do_importance_sampling and fg_ray_samples_packed.samples_pos.shape[0]!=0:
+            #         fg_ray_samples_packed=importance_sampling_sdf_model(model_sdf, fg_ray_samples_packed, ray_origins, ray_dirs, ray_t_exit, iter_nr_for_anneal)
+
+            #     #adjust nr_rays_to_create based on how many samples we have in total
+            #     cur_nr_samples=fg_ray_samples_packed.samples_pos.shape[0]
+            #     multiplier_nr_samples=float(hyperparams.target_nr_of_samples)/cur_nr_samples
+            #     nr_rays_to_create=int(nr_rays_to_create*multiplier_nr_samples)
+            #     colmap_data.thread_start_gen_rays(nr_rays_to_create)
+
+            # pred_rgb, pred_rgb_bg, pred_normals, sdf_gradients, weights_sum  = run_net2(args, ray_origins, img_indices, model_sdf, model_rgb, model_bg, model_colorcal, iter_nr_for_anneal,  cos_anneal_ratio, forced_variance, fg_ray_samples_packed, bg_ray_samples_packed)
 
             TIME_START("run_net")
             pred_rgb, pred_rgb_bg, pred_normals, sdf_gradients, weights_sum, fg_ray_samples_packed  =run_net(args, hyperparams, ray_origins, ray_dirs, img_indices, model_sdf, model_rgb, model_bg, model_colorcal, occupancy_grid, iter_nr_for_anneal,  cos_anneal_ratio, forced_variance)
             TIME_END("run_net")
             
+            with torch.set_grad_enabled(False):
+                #adjust nr_rays_to_create based on how many samples we have in total
+                cur_nr_samples=fg_ray_samples_packed.samples_pos.shape[0]
+                multiplier_nr_samples=float(hyperparams.target_nr_of_samples)/cur_nr_samples
+                nr_rays_to_create=int(nr_rays_to_create*multiplier_nr_samples)
+                colmap_data.thread_start_gen_rays(nr_rays_to_create)
 
-            
             #losses -----
             #rgb loss
             loss_rgb=rgb_loss(gt_selected, pred_rgb, does_ray_intersect_box)
@@ -511,11 +630,7 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
                     occupancy_grid.update_with_sdf_random_sample(grid_center_indices, sdf_grid, model_rgb.volume_renderer_neus.get_last_inv_s(), 1e-4 )
                     # occupancy_grid.update_with_sdf_random_sample(grid_center_indices, sdf_grid, model_rgb.volume_renderer_neus.get_last_inv_s().item(), 1e-4 )
 
-                #adjust nr_rays_to_create based on how many samples we have in total
-                cur_nr_samples=fg_ray_samples_packed.samples_pos.shape[0]
-                multiplier_nr_samples=float(hyperparams.target_nr_of_samples)/cur_nr_samples
-                nr_rays_to_create=int(nr_rays_to_create*multiplier_nr_samples)
-
+                
                 #increase also the WD on the encoding of the model_rgb to encourage the network to get high detail using the model_sdf
                 if iter_nr_for_anneal>=hyperparams.iter_start_reduce_curv:
                     for group in optimizer.param_groups:
@@ -656,12 +771,6 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
         # if with_viewer:
         #     view.update()
       
-
-                   
-
-
-                  
-
 
     print("finished trainng")
     return

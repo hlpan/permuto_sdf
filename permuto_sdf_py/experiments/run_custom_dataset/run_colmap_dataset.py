@@ -6,6 +6,10 @@
 #CALL with ./permuto_sdf_py/experiments/run_custom_dataset/run_custom_dataset.py --exp_info test [--no_viewer]
 
 import torch
+from torch.utils.data import Dataset
+import torch.nn.functional as F
+import threading, time
+
 import argparse
 import os
 import natsort
@@ -18,11 +22,13 @@ from dataloaders import *
 import permuto_sdf
 from permuto_sdf  import TrainParams
 from permuto_sdf_py.utils.common_utils import create_dataloader
-from permuto_sdf_py.utils.common_utils import create_bb_mesh
+from permuto_sdf_py.utils.common_utils import create_bb_mesh, create_bb_for_dataset
+from permuto_sdf_py.utils.sdf_utils import extract_mesh_from_sdf_model
 from permuto_sdf_py.utils.permuto_sdf_utils import get_frames_cropped
 from permuto_sdf_py.train_permuto_sdf import train
 from permuto_sdf_py.train_permuto_sdf import HyperParamsPermutoSDF
 import permuto_sdf_py.paths.list_of_training_scenes as list_scenes
+from permuto_sdf_py.models.models import SDF
 from permuto_sdf import NGPGui
 
 from dataloaders import *
@@ -36,12 +42,15 @@ from colmap_utils import \
     read_cameras_binary, read_images_binary, read_points3d_binary
 
 parser = argparse.ArgumentParser(description='Train sdf and color')
+parser.add_argument('--run_type', default="view", type=str, help='run type: view, train, mesh')
+parser.add_argument('--ckpt', default="200000", type=int, help='check point')
+parser.add_argument('--mesh_res', default="700", type=int,  help="Resolution of the mesh, 700~2300")
 parser.add_argument('--dataset', default="custom", help='Dataset name which can also be custom in which case the user has to provide their own data')
 parser.add_argument('--dataset_path', default="/media/rosu/Data/data/permuto_sdf_data/easy_pbr_renders/head/", help='Dataset path')
 parser.add_argument('--with_mask', action='store_true', help="Set this to true in order to train with a mask")
 parser.add_argument('--exp_info', default="", help='Experiment info string useful for distinguishing one experiment for another')
 parser.add_argument('--no_viewer', action='store_true', help="Set this to true in order disable the viewer")
-parser.add_argument('--scene_scale', default=1.0, type=float, help='Scale of the scene so that it fits inside the unit sphere')
+parser.add_argument('--scene_scale', default=0.25, type=float, help='Scale of the scene so that it fits inside the unit sphere')
 parser.add_argument('--scene_translation', default=[0,0,0], type=float, nargs=3, help='Translation of the scene so that it fits inside the unit sphere')
 parser.add_argument('--img_subsample', default=1.0, type=float, help="The higher the subsample value, the smaller the images are. Useful for low vram")
 args = parser.parse_args()
@@ -51,8 +60,12 @@ with_viewer=not args.no_viewer
 #MODIFY these for your dataset!
 SCENE_SCALE=args.scene_scale
 SCENE_TRANSLATION=args.scene_translation
-SCENE_SCALE=0.25
-SCENE_TRANSLATION=[0.11903904248331793,0.24058634782431088,0.19656414617581808]
+#SCENE_SCALE=0.125
+#SCENE_TRANSLATION=[0,0,0]
+
+#SCENE_SCALE=0.25
+#SCENE_TRANSLATION = [0.47, 2.45, 2.19]#germany
+#SCENE_TRANSLATION=[0.11903904248331793,0.24058634782431088,0.19656414617581808]
 IMG_SUBSAMPLE_FACTOR=args.img_subsample #subsample the image to lower resolution in case you are running on a low VRAM GPU. The higher this number, the smaller the images
 DATASET_PATH=args.dataset_path #point this to wherever you downloaded the easypbr_data (see README.md for download link)
  
@@ -139,22 +152,21 @@ def create_custom_dataset():
     
     return frames
 
-class ColmapData():
+class ColmapDatasetBase():
 
-    def __init__(self, root_dir, img_downscale):
+    def setup(self, root_dir, device = torch.device('cuda:0')):
         "read colmap dataset"
         camdata = read_cameras_binary(os.path.join(root_dir, 'sparse/0/cameras.bin'))
         imdata = read_images_binary(os.path.join(root_dir, 'sparse/0/images.bin'))
 
         
+        #intrinsic
         all_size, all_fxy, all_cxy = [], [], []
+        #camera to world coordinate
         all_R = []
         all_C = []
         all_images = []
         frames = []
-        #camera to world coordinate
-        #intrinsic, fx, fy, width, height
-        cam_poses = torch.empty(size=(len(imdata.values()),3), dtype=torch.float32, device=torch.device('cpu'))
         for i, d in enumerate(imdata.values()):
             # if i > 0:
             #     continue
@@ -171,21 +183,21 @@ class ColmapData():
 
             camera = camdata[d.camera_id]
 
-            img_width = int(camera.width* img_downscale)
-            img_height= int(camera.height* img_downscale)
+            img_width = int(camera.width / IMG_SUBSAMPLE_FACTOR)
+            img_height= int(camera.height / IMG_SUBSAMPLE_FACTOR)
             all_size.append(torch.tensor([[img_width], [img_height]], dtype=torch.int32, device='cpu'))
             
 
             # TODO scale
             if camera.model == 'SIMPLE_RADIAL':
-                fx = fy = camera.params[0] * img_downscale
-                cx = camera.params[1] * img_downscale
-                cy = camera.params[2] * img_downscale
+                fx = fy = camera.params[0] / IMG_SUBSAMPLE_FACTOR
+                cx = camera.params[1] / IMG_SUBSAMPLE_FACTOR
+                cy = camera.params[2] / IMG_SUBSAMPLE_FACTOR
             elif camera.model in ['PINHOLE', 'OPENCV']:
-                fx = camera.params[0] * img_downscale
-                fy = camera.params[1] * img_downscale
-                cx = camera.params[2] * img_downscale
-                cy = camera.params[3] * img_downscale
+                fx = camera.params[0] / IMG_SUBSAMPLE_FACTOR
+                fy = camera.params[1] / IMG_SUBSAMPLE_FACTOR
+                cx = camera.params[2] / IMG_SUBSAMPLE_FACTOR
+                cy = camera.params[3] / IMG_SUBSAMPLE_FACTOR
             else:
                 raise ValueError(f"Please parse the intrinsics for camera model {camdata[1].model}!")
 
@@ -196,20 +208,26 @@ class ColmapData():
             img_path = os.path.join(root_dir, "images", d.name)
             img = Image.open(img_path)
             
-            if img_downscale != 1:
+            if IMG_SUBSAMPLE_FACTOR != 1.0:
                 img = img.resize(size=(img_width, img_height))
+            frame=Frame()
 
+            if args.run_type == "view":
+                temp = Mat()
+                s = np.array(img).astype(np.float32)/255
+                temp.from_numpy(s)
+                temp = temp.rgb2bgr()
+                frame.rgb_32f=temp
             img = TF.to_tensor(img).permute(1, 2, 0)[...,:3]
-            
+            #frame.rgb_32f.from_numpy(img.numpy())
         
             all_images.append(img)
 
 
-            frame=Frame()
 
             #img_size
-            frame.width=int(camera.width* img_downscale)
-            frame.height=int(camera.height* img_downscale)
+            frame.width=img_width
+            frame.height=img_height
 
             #intrinsics as fx, fy, cx, cy
             K=np.identity(3)
@@ -228,51 +246,30 @@ class ColmapData():
 
             # img=Mat(os.path.join(root_dir, "images", d.name))
 
+    
+            #frame.rgb_32f.create(0,0,3)
             #frame.rgb_32f.from_numpy(img.numpy())
-            img=Mat(img_path)
-            img=img.to_cv32f()
-            #get rgb part and possibly the alpha as a mask
-            if img.channels()==4:
-                img_rgb=img.rgba2rgb()
-            else:
-                img_rgb=img
-            #get the alpha a a mask if necessary
-            if args.with_mask and img.channels()==4:
-                img_mask=img.get_channel(3)
-                frame.mask=img_mask
-            if args.with_mask and not img.channels()==4:
-                exit("You are requiring to use a foreground-background mask which should be in the alpha channel of the image. But the image does not have 4 channels")
-            frame.rgb_32f=img_rgb 
-
-
-            #extrinsics as a tf_cam_world (transformation that maps from world to camera coordiantes)
-            #tf_cam_world=Affine3f()
-
-            # in colmap the quaternion is expressed as [qw, qx,qy,qz]
-            # in eigen the quaternion is expressed as [qx,qy,qz,qw]
-            # qw, qx,qy,qz = d.qvec
-            # tf_cam_world.set_quat(np.array([qx,qy,qz,qw]))
-            # tf_cam_world.set_translation(t)
-            # frame.tf_cam_world=tf_cam_world
-
-
-            # ALTERNATIVELLY if you have already the extrinsics as a numpy matrix you can use the following line
-            #frame.tf_cam_world.from_matrix(YOUR_4x4_TF_CAM_WORLD_NUMPY_MATRIX) 
-
-            #scale scene so that the object of interest is within a sphere at the origin with radius 0.5
-            # tf_world_cam_rescaled = frame.tf_cam_world.inverse()
-            # translation=tf_world_cam_rescaled.translation().copy()
-            # translation*=SCENE_SCALE
-            # translation+=SCENE_TRANSLATION
-            # tf_world_cam_rescaled.set_translation(translation)
-            # frame.tf_cam_world=tf_world_cam_rescaled.inverse()
+            # img=Mat(img_path)
+            # img=img.to_cv32f()
+            # #get rgb part and possibly the alpha as a mask
+            # if img.channels()==4:
+            #     img_rgb=img.rgba2rgb()
+            # else:
+            #     img_rgb=img
+            # #get the alpha a a mask if necessary
+            # if args.with_mask and img.channels()==4:
+            #     img_mask=img.get_channel(3)
+            #     frame.mask=img_mask
+            # if args.with_mask and not img.channels()==4:
+            #     exit("You are requiring to use a foreground-background mask which should be in the alpha channel of the image. But the image does not have 4 channels")
+            # frame.rgb_32f=img_rgb 
 
             # #subsample the image to lower resolution in case you are running on a low VRAM GPU
             # frame=frame.subsample(IMG_SUBSAMPLE_FACTOR)
 
             #append to the scene so the frustums are visualized if the viewer is enabled
-            # frustum_mesh=frame.create_frustum_mesh(scale_multiplier=0.06)
-            # Scene.show(frustum_mesh, "frustum_mesh_"+str(i))
+            frustum_mesh=frame.create_frustum_mesh(scale_multiplier=0.06)
+            Scene.show(frustum_mesh, "frustum_mesh_"+str(i))
 
             #finish
             frames.append(frame)
@@ -283,14 +280,14 @@ class ColmapData():
         self.all_images = all_images
 
         #rotation from camera to world
-        self.all_R = torch.stack(all_R, dim=0).to('cuda:0')   
+        self.all_R = torch.stack(all_R, dim=0)#.to('cuda:0')   
 
         #camera pos
-        self.all_C = torch.stack(all_C, dim=0).to('cuda:0')   
+        self.all_C = torch.stack(all_C, dim=0)#.to('cuda:0')   
 
-        self.all_size = torch.stack(all_size, dim=0).to('cuda:0')      
-        self.all_fxy = torch.stack(all_fxy, dim=0).to('cuda:0')      
-        self.all_cxy = torch.stack(all_cxy, dim=0).to('cuda:0')      
+        self.all_size = torch.stack(all_size, dim=0)#.to('cuda:0')      
+        self.all_fxy = torch.stack(all_fxy, dim=0)#.to('cuda:0')      
+        self.all_cxy = torch.stack(all_cxy, dim=0)#.to('cuda:0')      
 
         pts3d = read_points3d_binary(os.path.join(root_dir, 'sparse/0/points3D.bin'))
         pts3d = np.array([pts3d[k].xyz for k in pts3d])
@@ -314,6 +311,58 @@ class ColmapData():
         bb_mesh.m_vis.m_line_color = [0.1, 0.9, 0.1]
         Scene.show(bb_mesh,"my_bb_mesh")
 
+    def get_rays(self, train_num_rays = 512):
+        "get train_num_rays random rays from colmap dataset"
+
+        #TIME_START("cam_compute")
+        image_index = torch.randint(0, len(self.all_C), size=(train_num_rays,), device=torch.device('cpu'))
+        xy_rand = torch.rand(size=(train_num_rays,2,1), device=torch.device('cpu'))
+        point_2d =(xy_rand*self.all_size[image_index])//1
+        pixel_2d = point_2d.int().squeeze()
+        
+        point_2d = (point_2d+0.5-self.all_cxy[image_index])/self.all_fxy[image_index]
+
+        one_tensor = torch.ones_like(point_2d[:,:1,:])
+        point_3d = torch.cat((point_2d, one_tensor), dim=1)
+        point_3d = self.all_R[image_index]@point_3d
+        point_3d = F.normalize(point_3d, dim=1)
+        ray_dirs = point_3d.squeeze()
+
+        #T1 = time.time()
+        gt_rgb = torch.empty((train_num_rays, 3), dtype=torch.float32, device=torch.device('cpu'))
+        #TIME_END("cam_compute")
+        #TIME_START("rgb_copy")
+        for i in range(train_num_rays):
+            x,y = pixel_2d[i]
+            gt_rgb_pixel = self.all_images[image_index[i]][y, x]
+            gt_rgb[i]=gt_rgb_pixel
+
+        #TIME_END("rgb_copy")
+        # T2 = time.time()
+        # print(f'rays:{train_num_rays} time: {((T2 - T1)*1000)} ms')
+        
+        gt_mask = torch.ones((train_num_rays, 1), dtype=torch.float32, device=torch.device('cuda:0'))
+        self.train_data = (self.all_C[image_index].squeeze().to('cuda:0'), ray_dirs.squeeze().to('cuda:0'), gt_rgb.to('cuda:0'), gt_mask, image_index.to('cuda:0')) 
+
+    def thread_start_gen_rays(self, train_num_rays = 512):
+        "spawn a new thread to generate rays"
+        self.thread = threading.Thread(target=self.get_rays, args=(train_num_rays,))
+        self.thread.start()
+    def thread_end_gen_rays(self):
+        self.thread.join()
+    
+def extract_mesh_and_transform_to_original_tf(model, nr_points_per_dim, loader, aabb):
+    extracted_mesh=extract_mesh_from_sdf_model(model, nr_points_per_dim=nr_points_per_dim, min_val=-0.5, max_val=0.5)
+        
+
+    # extracted_mesh=aabb.remove_points_outside(extracted_mesh)
+    #remove points outside the aabb
+    points=torch.from_numpy(extracted_mesh.V).float().cuda()
+    is_valid=aabb.check_point_inside_primitive(points)
+    extracted_mesh.remove_marked_vertices( is_valid.flatten().bool().cpu().numpy() ,True)
+    extracted_mesh.recalculate_min_max_height()
+
+    return extracted_mesh
 def run():
 
     config_file="train_permuto_sdf.cfg"
@@ -366,12 +415,50 @@ def run():
 
     #colmap_dataset = ColmapData("/workspace/home/nerf-data/tanksandtemple/Truck/dense/", 1)
     #colmap_dataset = ColmapData("/workspace/home/nerf-data/germany/dense/", 0.1)
-    colmap_dataset = ColmapData("/workspace/home/nerf-data/tanksandtemple/Ignatius2/dense/", 1)
+    #colmap_dataset = ColmapDatasetBase()
+    #colmap_dataset.setup("/workspace/home/nerf-data/tanksandtemple/Ignatius2/dense/", 1)
+    #colmap_dataset.setup("/workspace/home/nerf-data/tanksandtemple/Barn2/dense/", 1)
+    #colmap_dataset.setup(args.dataset_path)
     #tensor_reels=MiscDataFuncs.frames2tensors(colmap_dataset.frames)
-    tensor_reels = None
-    train(args, config_path, hyperparams, train_params, None, experiment_name, with_viewer, checkpoint_path, tensor_reel=tensor_reels, frames_train=colmap_dataset.frames, hardcoded_cam_init=False, colmap_data=colmap_dataset)
+    #tensor_reels = None
+    
+    if args.run_type in ["view", "train"]:
+        colmap_dataset = ColmapDatasetBase()
+        colmap_dataset.setup(args.dataset_path)
+
+    if args.run_type == "view":
+        view=Viewer.create(config_path)
+        while(True):
+            view.update()
+    elif(args.run_type == "train"):
+        train(args, config_path, hyperparams, train_params, None, experiment_name, with_viewer, checkpoint_path, tensor_reel=None, frames_train=colmap_dataset.frames, hardcoded_cam_init=False, colmap_data=colmap_dataset)
+    elif(args.run_type == "mesh"):
+        #get the list of checkpoints
+        config_training="with_mask_"+str(args.with_mask) 
+        ckpt_path_full=os.path.join(checkpoint_path, experiment_name,str(args.ckpt),"models")
+
+        #
+        aabb = create_bb_for_dataset(args.dataset)
+        #params for rendering
+        model_sdf=SDF(in_channels=3, boundary_primitive=aabb, geom_feat_size_out=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.sdf_nr_iters_for_c2f).to("cuda")
+
+        #load
+        checkpoint_path_sdf=os.path.join(ckpt_path_full,"sdf_model.pt")
+        model_sdf.load_state_dict(torch.load(checkpoint_path_sdf) )
+        model_sdf.eval()
 
 
+        #extract my mesh
+        extracted_mesh=extract_mesh_and_transform_to_original_tf(model_sdf, nr_points_per_dim=int(args.mesh_res), loader=None, aabb=aabb)
+        
+        #output path
+        out_mesh_path=os.path.join(permuto_sdf_root,"results/output_permuto_sdf_meshes",args.dataset, config_training)
+        os.makedirs(out_mesh_path, exist_ok=True)
+
+        # #write my mesh
+        extracted_mesh.save_to_file(os.path.join(out_mesh_path, f"{experiment_name}-{args.ckpt}-{args.mesh_res}.ply") )
+    else:
+        print("Error run_type")
 
 def main():
     run()
@@ -383,8 +470,8 @@ if __name__ == "__main__":
     # config_path=os.path.join( os.path.dirname( os.path.realpath(__file__) ) , '../../../config', config_file)
     # view=Viewer.create(config_path)
     # ngp_gui=NGPGui.create(view)
-    # colmap_dataset = ColmapData("/workspace/home/nerf-data/germany/dense/", 1)
-
+    # colmap_dataset = ColmapDatasetBase()
+    # colmap_dataset.setup("/workspace/home/nerf-data/germany/dense/", 1)
     # while(True):
     #     view.update()
     # pass
