@@ -44,7 +44,8 @@ from colmap_utils import \
 parser = argparse.ArgumentParser(description='Train sdf and color')
 parser.add_argument('--run_type', default="view", type=str, help='run type: view, train, mesh')
 parser.add_argument('--ckpt', default="200000", type=int, help='check point')
-parser.add_argument('--mesh_res', default="700", type=int,  help="Resolution of the mesh, 700~2300")
+parser.add_argument('--mesh_res', default=700, type=int,  help="Resolution of the mesh, 700~2300")
+parser.add_argument('--mesh_folder', default="", type=str,  help="output mesh path")
 parser.add_argument('--dataset', default="custom", help='Dataset name which can also be custom in which case the user has to provide their own data')
 parser.add_argument('--dataset_path', default="/media/rosu/Data/data/permuto_sdf_data/easy_pbr_renders/head/", help='Dataset path')
 parser.add_argument('--with_mask', action='store_true', help="Set this to true in order to train with a mask")
@@ -53,9 +54,15 @@ parser.add_argument('--no_viewer', action='store_true', help="Set this to true i
 parser.add_argument('--scene_scale', default=0.25, type=float, help='Scale of the scene so that it fits inside the unit sphere')
 parser.add_argument('--scene_translation', default=[0,0,0], type=float, nargs=3, help='Translation of the scene so that it fits inside the unit sphere')
 parser.add_argument('--img_subsample', default=1.0, type=float, help="The higher the subsample value, the smaller the images are. Useful for low vram")
+parser.add_argument('--train_mult', default=1.0, type=float, help="The higher the train_mult value, the longer trainning time")
+
 args = parser.parse_args()
 with_viewer=not args.no_viewer
 
+if args.run_type == "mesh":
+    if not os.path.isdir(args.mesh_folder):
+        print("please set the output mesh folder by --mesh_folder")
+        exit()
 
 #MODIFY these for your dataset!
 SCENE_SCALE=args.scene_scale
@@ -69,88 +76,6 @@ SCENE_TRANSLATION=args.scene_translation
 IMG_SUBSAMPLE_FACTOR=args.img_subsample #subsample the image to lower resolution in case you are running on a low VRAM GPU. The higher this number, the smaller the images
 DATASET_PATH=args.dataset_path #point this to wherever you downloaded the easypbr_data (see README.md for download link)
  
-def create_custom_dataset():
-    #CREATE CUSTOM DATASET---------------------------
-    #We need to fill easypbr.Frame objects into a list. Each Frame object contains the image for a specific camera together with extrinsics and intrinsics
-    #intrinsics and extrinsics
-    assert os.path.exists(DATASET_PATH), "The dataset path does not exist. Please point to the path where you downloaded the EasyPBR renders"
-
-
-    intrinics_extrinsics_file=os.path.join(DATASET_PATH,"poses_and_intrinsics.txt")
-    with open(intrinics_extrinsics_file) as file:
-        lines = [line.rstrip() for line in file]
-    #remove comments
-    lines = [item for item in lines if not item.startswith('#')]
-    #images
-    path_imgs=os.path.join(DATASET_PATH,"imgs_train") #modify this to wherever your 
-    imgs_names_list=[img_name for img_name in os.listdir(path_imgs)]
-    imgs_names_list=natsort.natsorted(imgs_names_list,reverse=False)
-
-    #create list of frames for this scene
-    frames=[]
-    for idx, img_name in enumerate(imgs_names_list):
-        #load img as single precision RGB
-        print("img_name", img_name)
-        frame=Frame()
-        img=Mat(os.path.join(path_imgs,img_name))
-        img=img.to_cv32f()
-        #get rgb part and possibly the alpha as a mask
-        if img.channels()==4:
-            img_rgb=img.rgba2rgb()
-        else:
-            img_rgb=img
-        #get the alpha a a mask if necessary
-        if args.with_mask and img.channels()==4:
-            img_mask=img.get_channel(3)
-            frame.mask=img_mask
-        if args.with_mask and not img.channels()==4:
-            exit("You are requiring to use a foreground-background mask which should be in the alpha channel of the image. But the image does not have 4 channels")
-        frame.rgb_32f=img_rgb 
-
-        #img_size
-        frame.width=img.cols
-        frame.height=img.rows
-
-        #intrinsics as fx, fy, cx, cy
-        calib_line=lines[idx]
-        calib_line_split=calib_line.split()
-        K=np.identity(3)
-        K[0][0]=calib_line_split[-4] #fx
-        K[1][1]=calib_line_split[-3] #fy
-        K[0][2]=calib_line_split[-2] #cx
-        K[1][2]=calib_line_split[-1] #cy
-        frame.K=K
-
-        #extrinsics as a tf_cam_world (transformation that maps from world to camera coordiantes)
-        translation_world_cam=calib_line_split[1:4] #translates from cam to world
-        quaternion_world_cam=calib_line_split[4:8] #rotates from cam to world
-        tf_world_cam=Affine3f()
-        tf_world_cam.set_quat(quaternion_world_cam) #assumes the quaternion is expressed as [qx,qy,qz,qw]
-        tf_world_cam.set_translation(translation_world_cam)
-        tf_cam_world=tf_world_cam.inverse() #here we get the tf_cam_world that we need
-        frame.tf_cam_world=tf_cam_world
-        #ALTERNATIVELLY if you have already the extrinsics as a numpy matrix you can use the following line
-        # frame.tf_cam_world.from_matrix(YOUR_4x4_TF_CAM_WORLD_NUMPY_MATRIX) 
-
-        #scale scene so that the object of interest is within a sphere at the origin with radius 0.5
-        tf_world_cam_rescaled = frame.tf_cam_world.inverse()
-        translation=tf_world_cam_rescaled.translation().copy()
-        translation*=SCENE_SCALE
-        translation+=SCENE_TRANSLATION
-        tf_world_cam_rescaled.set_translation(translation)
-        frame.tf_cam_world=tf_world_cam_rescaled.inverse()
-
-        #subsample the image to lower resolution in case you are running on a low VRAM GPU
-        frame=frame.subsample(IMG_SUBSAMPLE_FACTOR)
-
-        #append to the scene so the frustums are visualized if the viewer is enabled
-        frustum_mesh=frame.create_frustum_mesh(scale_multiplier=0.06)
-        Scene.show(frustum_mesh, "frustum_mesh_"+str(idx))
-
-        #finish
-        frames.append(frame)
-    
-    return frames
 
 class ColmapDatasetBase():
 
@@ -369,7 +294,8 @@ def run():
     config_path=os.path.join( os.path.dirname( os.path.realpath(__file__) ) , '../../../config', config_file)
     train_params=TrainParams.create(config_path)
     hyperparams=HyperParamsPermutoSDF()
-
+    
+    #hyperparams.s_mult = args.train_mult
 
     #get the checkpoints path which will be at the root of the permuto_sdf package 
     permuto_sdf_root=os.path.dirname(os.path.abspath(permuto_sdf.__file__))
@@ -451,12 +377,13 @@ def run():
         #extract my mesh
         extracted_mesh=extract_mesh_and_transform_to_original_tf(model_sdf, nr_points_per_dim=int(args.mesh_res), loader=None, aabb=aabb)
         
-        #output path
-        out_mesh_path=os.path.join(permuto_sdf_root,"results/output_permuto_sdf_meshes",args.dataset, config_training)
-        os.makedirs(out_mesh_path, exist_ok=True)
+       
+        # #output path
+        # out_mesh_path=os.path.join(permuto_sdf_root,"results/output_permuto_sdf_meshes",args.dataset, config_training)
+        # os.makedirs(out_mesh_path, exist_ok=True)
 
         # #write my mesh
-        extracted_mesh.save_to_file(os.path.join(out_mesh_path, f"{experiment_name}-{args.ckpt}-{args.mesh_res}.ply") )
+        extracted_mesh.save_to_file(os.path.join(args.mesh_folder, f"{experiment_name}-{args.ckpt}-{args.mesh_res}.ply") )
     else:
         print("Error run_type")
 

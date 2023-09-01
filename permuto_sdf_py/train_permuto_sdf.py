@@ -434,6 +434,7 @@ def get_colmap_rays_cpu(colmap_data, train_num_rays = 512):
 
 def train(args, config_path, hyperparams, train_params, loader_train, experiment_name, with_viewer, checkpoint_path, tensor_reel, frames_train=None, hardcoded_cam_init=True, colmap_data=None):
 
+    print(f"smult = {hyperparams.s_mult}")
     #ray_origins, ray_dirs, gt_selected, gt_mask, img_indices = get_colmap_rays_cpu(colmap_data)
     
     
@@ -507,7 +508,8 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
     first_time_getting_control=True
     is_in_training_loop=True
     nr_rays_to_create=hyperparams.nr_rays
-    colmap_data.thread_start_gen_rays(nr_rays_to_create)
+    if colmap_data is not None:
+        colmap_data.thread_start_gen_rays(nr_rays_to_create)
     while is_in_training_loop:
         model_sdf.train(phase.grad)
         model_rgb.train(phase.grad)
@@ -581,7 +583,8 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
                 cur_nr_samples=fg_ray_samples_packed.samples_pos.shape[0]
                 multiplier_nr_samples=float(hyperparams.target_nr_of_samples)/cur_nr_samples
                 nr_rays_to_create=int(nr_rays_to_create*multiplier_nr_samples)
-                colmap_data.thread_start_gen_rays(nr_rays_to_create)
+                if colmap_data is not None:
+                    colmap_data.thread_start_gen_rays(nr_rays_to_create)
 
             #losses -----
             #rgb loss
